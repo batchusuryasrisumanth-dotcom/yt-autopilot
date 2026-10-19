@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+yt_autopilot: give it context -> it writes the script, records the voiceover,
+builds the video, and (after your approval) uploads it to YouTube.
+
+Usage:
+  python yt_autopilot.py --context "5 mistakes beginners make when learning guitar"
+  python yt_autopilot.py --context-file notes.txt --minutes 3 --voice en-IN-NeerjaNeural
+  python yt_autopilot.py --context "..." --no-upload      # only build the video
+"""
+import argparse, asyncio, json, os, re, sys, textwrap
+from pathlib import Path
+
+import anthropic
+import edge_tts
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from moviepy import AudioFileClip, ImageClip, concatenate_videoclips
+
+W, H = 1920, 1080
+MODEL = "claude-sonnet-5-5"
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+
+# ---------- 1. Script / plan -------------------------------------------------
+def make_plan(context: str, minutes: float, language: str) -> dict:
+    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+    words = int(minutes * 150)
+    prompt = f"""You are a YouTube scriptwriter. Using ONLY the context below, plan a video of about {minutes} minutes (~{words} spoken words total) in {language}.
+
+Return ONLY valid JSON, no markdown fences, with this shape:
+{{
+  "title": "catchy, honest title under 70 chars",
+  "description": "2-4 sentence description + a short call to action",
+  "tags": ["8-12 relevant tags"],
+  "scenes": [
+    {{"heading": "short on-screen heading (max 6 words)",
+      "narration": "what the voiceover says for this scene (2-4 sentences)",
+      "image_query": "2-3 word stock photo search term"}}
+  ]
+}}
+Use 5-10 scenes. Start with a hook, end with a call to action. Do not invent facts that aren't in the context or common knowledge.
+
+CONTEXT:
+{context}"""
+    msg = client.messages.create(
+        model=MODEL, max_tokens=4000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = "".join(b.text for b in msg.content if b.type == "text")
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+    return json.loads(text)
+
+
+# ---------- 2. Voiceover ------------------------------------------------------
+async def _tts(text: str, voice: str, path: Path):
+    await edge_tts.Communicate(text, voice).save(str(path))
+
+
+def make_voiceovers(plan: dict, voice: str, out: Path) -> list[Path]:
+    paths = []
+    for i, s in enumerate(plan["scenes"]):
+        p = out / f"voice_{i:02d}.mp3"
+        asyncio.run(_tts(s["narration"], voice, p))
+        paths.append(p)
+    return paths
+
+
+# ---------- 3. Visuals --------------------------------------------------------
+def _font(size: int):
+    for name in ("DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size=size)
+
+
+def _stock_photo(query: str):
+    key = os.getenv("PEXELS_API_KEY")
+    if not key:
+        return None
+    try:
+        r = requests.get("https://api.pexels.com/v1/search",
+                         headers={"Authorization": key},
+                         params={"query": query, "per_page": 1, "orientation": "landscape"},
+                         timeout=15)
+        url = r.json()["photos"][0]["src"]["large2x"]
+        return Image.open(requests.get(url, stream=True, timeout=30).raw).convert("RGB")
+    except Exception:
+        return None
+
+
+def make_slide(scene: dict, idx: int, out: Path) -> Path:
+    photo = _stock_photo(scene.get("image_query", ""))
+    if photo:
+        photo = photo.resize((W, int(photo.height * W / photo.width)))
+        top = max(0, (photo.height - H) // 2)
+        img = photo.crop((0, top, W, top + H))
+        img = Image.blend(img, Image.new("RGB", (W, H), (0, 0, 0)), 0.55)  # darken for text
+    else:
+        img = Image.new("RGB", (W, H))
+        d = ImageDraw.Draw(img)
+        for y in range(H):  # simple vertical gradient
+            t = y / H
+            d.line([(0, y), (W, y)], fill=(int(20 + 30 * t), int(25 + 20 * t), int(60 + 70 * t)))
+    d = ImageDraw.Draw(img)
+    font = _font(110)
+    lines = textwrap.wrap(scene["heading"], width=22)
+    line_h = 130
+    y = (H - line_h * len(lines)) // 2
+    for line in lines:
+        w = d.textlength(line, font=font)
+        d.text(((W - w) / 2, y), line, font=font, fill="white")
+        y += line_h
+    p = out / f"slide_{idx:02d}.png"
+    img.save(p)
+    return p
+
+
+# ---------- 4. Assemble -------------------------------------------------------
+def build_video(plan: dict, voices: list[Path], out: Path) -> Path:
+    clips = []
+    for i, (scene, v) in enumerate(zip(plan["scenes"], voices)):
+        audio = AudioFileClip(str(v))
+        slide = make_slide(scene, i, out)
+        clips.append(ImageClip(str(slide)).with_duration(audio.duration + 0.4).with_audio(audio))
+    final = concatenate_videoclips(clips, method="compose")
+    path = out / "video.mp4"
+    final.write_videofile(str(path), fps=24, codec="libx264", audio_codec="aac")
+    return path
+
+
+# ---------- 5. Upload ---------------------------------------------------------
+def upload(video: Path, plan: dict, privacy: str):
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+
+    token = Path("token.json")
+    creds = Credentials.from_authorized_user_file(token, SCOPES) if token.exists() else None
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+            creds = flow.run_local_server(port=0)
+        token.write_text(creds.to_json())
+
+    yt = build("youtube", "v3", credentials=creds)
+    body = {
+        "snippet": {"title": plan["title"][:100], "description": plan["description"],
+                    "tags": plan["tags"], "categoryId": "27"},  # 27 = Education
+        "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
+    }
+    req = yt.videos().insert(part="snippet,status", body=body,
+                             media_body=MediaFileUpload(str(video), chunksize=-1, resumable=True))
+    resp = None
+    while resp is None:
+        status, resp = req.next_chunk()
+        if status:
+            print(f"Uploading... {int(status.progress() * 100)}%")
+    print(f"Done: https://youtu.be/{resp['id']}")
+
+
+# ---------- main --------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--context", help="Text describing what the video should be about")
+    ap.add_argument("--context-file", help="Path to a text file with the context")
+    ap.add_argument("--minutes", type=float, default=2.0)
+    ap.add_argument("--language", default="English")
+    ap.add_argument("--voice", default="en-US-AriaNeural", help="any edge-tts voice name")
+    ap.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
+    ap.add_argument("--out", default="output")
+    ap.add_argument("--no-upload", action="store_true")
+    a = ap.parse_args()
+
+    context = a.context or (Path(a.context_file).read_text() if a.context_file else None)
+    if not context:
+        sys.exit("Give --context or --context-file")
+    out = Path(a.out); out.mkdir(exist_ok=True)
+
+    print("1/4 Writing script...")
+    plan = make_plan(context, a.minutes, a.language)
+    (out / "plan.json").write_text(json.dumps(plan, indent=2, ensure_ascii=False))
+    print(f"   Title: {plan['title']}  ({len(plan['scenes'])} scenes)")
+
+    print("2/4 Recording voiceover...")
+    voices = make_voiceovers(plan, a.voice, out)
+
+    print("3/4 Building video...")
+    video = build_video(plan, voices, out)
+    print(f"   Saved {video}")
+
+    if a.no_upload:
+        return
+    print("\n4/4 Review the video and plan.json, then confirm.")
+    if input(f"Upload as '{a.privacy}'? [y/N] ").strip().lower() == "y":
+        upload(video, plan, a.privacy)
+    else:
+        print("Skipped upload.")
+
+
+if __name__ == "__main__":
+    main()
